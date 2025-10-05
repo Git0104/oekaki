@@ -1,0 +1,313 @@
+<!doctype html>
+
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Supabase お絵描きサイト（完全版）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Helvetica Neue", Arial; max-width:1100px; margin:24px auto; padding:12px; }
+    header { display:flex; gap:12px; align-items:center; margin-bottom:12px; }
+    #controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    canvas { border:1px solid #ccc; touch-action: none; background: white; display:block; margin-top:12px; }
+    .btn { padding:8px 10px; border-radius:6px; border:1px solid #888; background:#f6f6f6; cursor:pointer; }
+    .btn:active { transform: translateY(1px); }
+    #gallery { display:flex; gap:8px; flex-wrap:wrap; margin-top:18px; }
+    .thumb { width:150px; height:150px; object-fit:cover; border:1px solid #ddd; border-radius:6px; }
+    .sidebar { margin-left:auto; text-align:right; }
+    input[type="range"] { width:120px; }
+    label { font-size:14px; }
+    #status { margin-top:8px; color:#333; font-size:14px; }
+    footer { margin-top:18px; color:#666; font-size:13px; }
+    .small { font-size:13px; color:#555; }
+  </style>
+  <!-- Supabase CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+</head>
+<body>
+  <header>
+    <h1>お絵描きボード（Supabase 保存）</h1>
+    <div class="sidebar">
+      <div id="userInfo" class="small">未ログイン</div>
+      <div style="margin-top:6px;">
+        <input id="emailInput" placeholder="メールでログイン" style="padding:6px;border:1px solid #ccc;border-radius:6px;">
+        <button class="btn" id="loginBtn">Magic Link 送信</button>
+        <button class="btn" id="logoutBtn" style="display:none">ログアウト</button>
+      </div>
+    </div>
+  </header>
+
+  <div id="controls">
+    <label>色: <input type="color" id="color" value="#000000"></label>
+    <label>太さ: <input id="size" type="range" min="1" max="40" value="4"></label>
+    <button class="btn" id="eraserBtn">消しゴム</button>
+    <button class="btn" id="undoBtn">戻る</button>
+    <button class="btn" id="clearBtn">全消去</button>
+    <button class="btn" id="saveBtn">保存 (Supabase)</button>
+    <span id="status"></span>
+  </div>
+
+<canvas id="board" width="800" height="600"></canvas>
+
+  <section>
+    <h2>ギャラリー</h2>
+    <div id="gallery"></div>
+  </section>
+
+  <footer>
+    <div class="small">使い方: 描いて → 保存 を押すと Supabase Storage に PNG を保存し、ギャラリーに追加されます。<br>
+    ※ 初回はコード内の <code>supabaseUrl</code> と <code>supabaseKey</code> を自分の値に置き換えてください。</div>
+  </footer>
+
+<script>
+/* =======================
+   必要な設定（ここを自分のものに置き換える）
+   ======================= */
+const supabaseUrl = "https://xiodxjoipeinrtoporbq.supabase.co"; // ← 自分の Supabase URL
+const supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhpb2R4am9pcGVpbnJ0b3BvcmJxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk2MTcxOTcsImV4cCI6MjA3NTE5MzE5N30.VYOPXh2NhkWw1DLqghEok_mwf5O0VFhsIACR1FYpPhw";                    // ← 自分の anon/public API key
+/* ======================= */
+
+const supabaseClient = supabase.createClient(supabaseUrl, supabaseKey);
+
+/* Canvas 描画系 */
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+let drawing = false;
+let last = { x: 0, y: 0 };
+let tool = 'pen'; // 'pen' or 'eraser'
+const colorInput = document.getElementById('color');
+const sizeInput = document.getElementById('size');
+const undoStack = [];
+const MAX_UNDO = 20;
+
+function pushUndo() {
+  try {
+    if (undoStack.length >= MAX_UNDO) undoStack.shift();
+    const img = ctx.getImageData(0,0,canvas.width,canvas.height);
+    undoStack.push(img);
+  } catch(e) {
+    // security or memory error -> ignore
+  }
+}
+
+function restoreUndo() {
+  if (!undoStack.length) return;
+  const img = undoStack.pop();
+  ctx.putImageData(img, 0, 0);
+}
+
+function setStrokeStyle() {
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = parseInt(sizeInput.value, 10);
+  ctx.globalCompositeOperation = (tool === 'eraser') ? 'destination-out' : 'source-over';
+  ctx.strokeStyle = colorInput.value;
+}
+
+function getPosFromEvent(e) {
+  if (e.touches && e.touches[0]) {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.touches[0].clientX - r.left, y: e.touches[0].clientY - r.top };
+  } else {
+    return { x: e.offsetX, y: e.offsetY };
+  }
+}
+
+function pointerDown(e) {
+  e.preventDefault();
+  drawing = true;
+  last = getPosFromEvent(e);
+  pushUndo();
+  setStrokeStyle();
+}
+
+function pointerMove(e) {
+  if (!drawing) return;
+  const p = getPosFromEvent(e);
+  ctx.beginPath();
+  ctx.moveTo(last.x, last.y);
+  ctx.lineTo(p.x, p.y);
+  ctx.stroke();
+  last = p;
+}
+
+function pointerUp(e) {
+  drawing = false;
+}
+
+canvas.addEventListener('pointerdown', pointerDown);
+canvas.addEventListener('pointermove', pointerMove);
+canvas.addEventListener('pointerup', pointerUp);
+canvas.addEventListener('pointerleave', pointerUp);
+// touch fallback
+canvas.addEventListener('touchstart', pointerDown);
+canvas.addEventListener('touchmove', pointerMove);
+canvas.addEventListener('touchend', pointerUp);
+
+document.getElementById('eraserBtn').addEventListener('click', () => {
+  tool = (tool === 'eraser') ? 'pen' : 'eraser';
+  document.getElementById('eraserBtn').textContent = (tool === 'eraser') ? '消しゴム（ON）' : '消しゴム';
+  setStrokeStyle();
+});
+document.getElementById('undoBtn').addEventListener('click', () => restoreUndo());
+document.getElementById('clearBtn').addEventListener('click', () => {
+  pushUndo();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+});
+
+/* ステータス表示 */
+const status = document.getElementById('status');
+function setStatus(text, timeout=3000) {
+  status.textContent = text;
+  if (timeout) setTimeout(()=> { if (status.textContent === text) status.textContent = ''; }, timeout);
+}
+
+/* 初期キャンバスを白で塗る（透明だと保存時に背景が透けるので） */
+function fillWhiteBg() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'destination-over';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.restore();
+}
+fillWhiteBg();
+
+/* =======================
+   Supabase 関連：保存・ギャラリー取得
+   ======================= */
+
+async function saveToSupabase() {
+  setStatus('保存中…');
+  try {
+    // canvas -> blob
+    const dataUrl = canvas.toDataURL('image/png');
+    const blob = await (await fetch(dataUrl)).blob();
+    const filename = `art-${Date.now()}.png`;
+    const path = filename;
+
+    // Storage にアップロード
+    const { data: uploadData, error: uploadErr } = await supabaseClient
+      .storage
+      .from('drawings')
+      .upload(path, blob, { cacheControl: '3600', upsert: false });
+
+    if (uploadErr) {
+      console.error('uploadErr', uploadErr);
+      setStatus('アップロード失敗');
+      return;
+    }
+
+    // public URL を取得（バケットが public の場合）
+    const { data: publicData } = supabaseClient
+      .storage
+      .from('drawings')
+      .getPublicUrl(path);
+
+    const publicUrl = publicData?.publicUrl ?? null;
+
+    // gallery テーブルにレコードを挿入（user_id はログインしていれば設定）
+    const user = supabaseClient.auth && supabaseClient.auth.user ? supabaseClient.auth.user() : null;
+    const { error: insertErr } = await supabaseClient
+      .from('gallery')
+      .insert([{ url: publicUrl, filename: filename, user_id: user ? user.id : null }]);
+
+    if (insertErr) {
+      console.error('insertErr', insertErr);
+      setStatus('ギャラリー登録エラー');
+      return;
+    }
+
+    setStatus('保存完了！');
+    loadGallery(); // ギャラリー更新
+  } catch (e) {
+    console.error(e);
+    setStatus('エラー発生');
+  }
+}
+document.getElementById('saveBtn').addEventListener('click', saveToSupabase);
+
+/* ギャラリー読み込み（gallery テーブルを参照） */
+async function loadGallery() {
+  const { data, error } = await supabaseClient
+    .from('gallery')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(40);
+
+  const g = document.getElementById('gallery');
+  g.innerHTML = '';
+  if (error) {
+    console.error('gallery load error', error);
+    return;
+  }
+  data.forEach(item => {
+    const img = document.createElement('img');
+    img.className = 'thumb';
+    img.src = item.url; // 公開URLを想定
+    img.alt = item.filename || 'drawing';
+    g.appendChild(img);
+  });
+}
+
+/* 初回ギャラリー読み込み */
+loadGallery();
+
+/* =======================
+   簡易認証（Magic Link）
+   ======================= */
+const emailInput = document.getElementById('emailInput');
+const loginBtn = document.getElementById('loginBtn');
+const logoutBtn = document.getElementById('logoutBtn');
+const userInfo = document.getElementById('userInfo');
+
+async function updateUserUI() {
+  const { data: { user } } = await supabaseClient.auth.getUser().catch(()=>({data:{user:null}}));
+  if (user) {
+    userInfo.textContent = `ログイン済み: ${user.email}`;
+    loginBtn.style.display = 'none';
+    emailInput.style.display = 'none';
+    logoutBtn.style.display = '';
+  } else {
+    userInfo.textContent = '未ログイン';
+    loginBtn.style.display = '';
+    emailInput.style.display = '';
+    logoutBtn.style.display = 'none';
+  }
+}
+
+// ログイン（Magic Link）
+loginBtn.addEventListener('click', async () => {
+  const email = emailInput.value.trim();
+  if (!email) return setStatus('メールを入力してね');
+  setStatus('ログインリンク送信中…');
+  const { error } = await supabaseClient.auth.signInWithOtp({ email });
+  if (error) {
+    console.error(error);
+    setStatus('送信エラー');
+  } else {
+    setStatus('メールを送信したよ（受信箱を確認）', 5000);
+  }
+});
+
+// ログアウト
+logoutBtn.addEventListener('click', async () => {
+  await supabaseClient.auth.signOut();
+  updateUserUI();
+  setStatus('ログアウトしました');
+});
+
+/* 認証状態の変化を監視（ログイン後に UI 更新など） */
+if (supabaseClient.auth.onAuthStateChange) {
+  supabaseClient.auth.onAuthStateChange((event, session) => {
+    updateUserUI();
+    // ログイン後はギャラリーに user_id を保存したい場合の処理等もここに
+  });
+}
+
+// 初期 UI 設定
+updateUserUI();
+
+</script>
+
+</body>
+</html>
